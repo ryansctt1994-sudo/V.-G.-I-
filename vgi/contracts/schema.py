@@ -21,9 +21,25 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from typing import Any, Optional
 
 CONTRACT_VERSION = "1.0.0"
+
+
+class ExecutionOutcome(str, Enum):
+    """The authoritative outcome of an attempted protected effect.
+
+    UNKNOWN is a legitimate terminal state, not a failure to be silently turned
+    into REFUSED or blindly retried: it means the system could not confirm
+    whether the effect took hold, and a false COMMITTED would be worse than
+    admitting uncertainty. CONFLICT means authentic signals disagree.
+    """
+
+    COMMITTED = "COMMITTED"
+    REFUSED = "REFUSED"
+    UNKNOWN = "UNKNOWN"
+    CONFLICT = "CONFLICT"
 
 
 def canonical(obj: Any) -> bytes:

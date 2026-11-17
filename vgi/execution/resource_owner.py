@@ -59,13 +59,16 @@ class ResourceOwner:
         executor_key: KeyPair,
         authority_verify_key: VerifyKey,
         freshness: FreshnessAuthority,
+        revocation=None,
     ):
         self._path = db_path
         self._key = executor_key
         self._authority = authority_verify_key
         self._freshness = freshness
-        self._conn = sqlite3.connect(db_path)
+        self._revocation = revocation  # optional RevocationRegistry (AUT-07)
+        self._conn = sqlite3.connect(db_path, timeout=30)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)"
         )
@@ -123,6 +126,11 @@ class ResourceOwner:
             stored = json.loads(existing[0])
             return SignedReceipt(**stored)
 
+        # (2b) Revocation (AUT-07). Checked only on a not-yet-consumed grant, so a
+        # committed effect is never retroactively undone by a later revocation.
+        if self._revocation is not None and self._revocation.is_revoked(grant_id):
+            raise AuthorizationError("grant has been revoked")
+
         # (3) Independent single-use gate. 'replay' here with no local record is
         # the snapshot-rollback signature -> reject.
         if self._freshness.consume(grant_id, int(grant["freshness_seq"])) == "replay":
@@ -145,19 +153,46 @@ class ResourceOwner:
 
         cur = self._conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
-        prior_row = cur.execute(
-            "SELECT value FROM config WHERE key = ?", (key,)
-        ).fetchone()
-        prior_value = prior_row[0] if prior_row else None
+        try:
+            prior_row = cur.execute(
+                "SELECT value FROM config WHERE key = ?", (key,)
+            ).fetchone()
+            prior_value = prior_row[0] if prior_row else None
 
-        if precondition is not None and prior_value != precondition:
+            if precondition is not None and prior_value != precondition:
+                receipt = Receipt(
+                    receipt_id=f"rcpt-{uuid.uuid4().hex[:12]}",
+                    grant_id=grant_id,
+                    effect_id=eid,
+                    outcome="rejected",
+                    prior_value=prior_value,
+                    new_value=prior_value,
+                    applied_at=time.time(),
+                )
+                signed = self._sign_receipt(receipt)
+                cur.execute(
+                    "INSERT INTO redemptions (grant_id, effect_id, receipt_json) "
+                    "VALUES (?, ?, ?)",
+                    (grant_id, eid, json.dumps(signed.to_dict())),
+                )
+                self._conn.commit()
+                return signed
+
+            # The effect and its redemption record commit together, or not at all.
+            # If the redemption ("chronicle") write fails, the effect rolls back:
+            # no protected state changes without an accounted record (SEC-013).
+            cur.execute(
+                "INSERT INTO config (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, new_value),
+            )
             receipt = Receipt(
                 receipt_id=f"rcpt-{uuid.uuid4().hex[:12]}",
                 grant_id=grant_id,
                 effect_id=eid,
-                outcome="rejected",
+                outcome="applied",
                 prior_value=prior_value,
-                new_value=prior_value,
+                new_value=new_value,
                 applied_at=time.time(),
             )
             signed = self._sign_receipt(receipt)
@@ -168,30 +203,9 @@ class ResourceOwner:
             )
             self._conn.commit()
             return signed
-
-        # Apply the effect and record the redemption atomically.
-        cur.execute(
-            "INSERT INTO config (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, new_value),
-        )
-        receipt = Receipt(
-            receipt_id=f"rcpt-{uuid.uuid4().hex[:12]}",
-            grant_id=grant_id,
-            effect_id=eid,
-            outcome="applied",
-            prior_value=prior_value,
-            new_value=new_value,
-            applied_at=time.time(),
-        )
-        signed = self._sign_receipt(receipt)
-        cur.execute(
-            "INSERT INTO redemptions (grant_id, effect_id, receipt_json) "
-            "VALUES (?, ?, ?)",
-            (grant_id, eid, json.dumps(signed.to_dict())),
-        )
-        self._conn.commit()
-        return signed
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def _sign_receipt(self, receipt: Receipt) -> SignedReceipt:
         payload = receipt.to_dict()

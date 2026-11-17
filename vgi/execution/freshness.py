@@ -25,8 +25,9 @@ ConsumeResult = Literal["ok", "replay"]
 class FreshnessAuthority:
     def __init__(self, db_path: str):
         self._path = db_path
-        self._conn = sqlite3.connect(db_path)
+        self._conn = sqlite3.connect(db_path, timeout=30)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS issued (seq INTEGER PRIMARY KEY)"
         )

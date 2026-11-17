@@ -16,7 +16,7 @@ dependencies = [
 dev = []
 
 [tool.setuptools]
-packages = ["vgi", "vgi.contracts", "vgi.intelligence", "vgi.governance", "vgi.execution", "vgi.evidence"]
+packages = ["vgi", "vgi.contracts", "vgi.intelligence", "vgi.governance", "vgi.execution", "vgi.evidence", "vgi.verification"]
 
 [tool.setuptools.package-dir]
 "" = "."

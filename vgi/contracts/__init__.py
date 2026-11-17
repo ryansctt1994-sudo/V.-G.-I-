@@ -3,6 +3,7 @@
 from vgi.contracts.schema import (  # noqa: F401
     CONTRACT_VERSION,
     Effect,
+    ExecutionOutcome,
     Grant,
     Observation,
     Proposal,

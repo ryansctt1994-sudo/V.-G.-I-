@@ -37,6 +37,15 @@ earlier research. These are the bar a clean rebuild has to clear:
 | *(why that works)* — the counter-example when freshness is **not** independent | `test_counterexample_rolling_back_freshness_too_resurrects_authority` |
 | **Receipt ≠ observation** — a signed receipt never substitutes for a direct read | `test_witness_catches_drift_between_receipt_and_reality`, `test_fabricated_receipt_fails_signature_check` |
 | **Idempotent recovery** — honest retries apply exactly once | `test_retry_of_same_grant_is_idempotent` |
+| **OS-enforced isolation** — kernel denies direct DB/WAL/credential access; grant-gated IPC only | `test_os_isolation` (needs root; skips otherwise) |
+| **Concurrent redemption** — many owners, one effect | `test_concurrency` |
+| **Revocation** — withdrawn authority fails under a declared ordering contract | `test_revocation` |
+| **Fail-closed** — policy/chronicle failure permits no effect | `test_failclosed` |
+| **Honest uncertainty** — unconfirmable external effect is `UNKNOWN`, never false `COMMITTED` | `test_outcomes` |
+| **No unchecked "proof"** — a missing checker yields `BLOCKED_DEPENDENCY`, not a pass | `test_verification` |
+
+Full claim-to-test mapping (including what is **not** yet built) is in
+[`docs/TRACEABILITY.md`](docs/TRACEABILITY.md).
 
 ## The architecture in one picture
 
@@ -79,32 +88,42 @@ deferred to production hardening.
 
 ```
 vgi/
-  contracts/    versioned schemas, canonical encoding, effect identity
+  contracts/    versioned schemas, canonical encoding, effect identity, outcomes
   intelligence/ untrusted proposer (where a model plugs in later)
-  governance/   policy evaluation + grant issuance   (authorization domain)
-  execution/    freshness authority, resource owner, broker (execution domain)
-  evidence/     durable receipts + independent witness (assurance domain)
+  governance/   policy, grant issuance, revocation       (authorization domain)
+  execution/    freshness, resource owner, broker,
+                owner_service + ipc (separate-UID + authenticated IPC),
+                outcome resolver                          (execution domain)
+  evidence/     durable receipts + independent witness    (assurance domain)
+  verification/ dependency preflight + fail-closed verifier
   crypto.py     Ed25519 signing primitives
   system.py     the one place that wires it all together
 apps/cli/       the end-to-end demo
-tests/          happy path + the negative regression suite
-docs/           architecture and threat model
+tests/          happy path + the negative regression suite (+ OS isolation)
+docs/           architecture, threat model, traceability matrix
 ```
 
 ## Where this goes next
 
-This slice is Phase 1 + Phase 2 of the plan, plus the start of Phase 3
-(evidence). The roadmap from here, each step earning its complexity through
-tests before the next is added:
+This slice now covers Phase 1 + Phase 2 plus the start of Phase 3 (evidence),
+and the keystone hardening is done: the resource owner runs under a **separate OS
+identity** with an **authenticated IPC** surface, so direct-write denial is
+enforced by the kernel, not just the API (`test_os_isolation`). The roadmap from
+here, each step earning its complexity through tests before the next is added:
 
-1. **Harden the boundary** — move the resource owner to a separate OS identity
-   with an authenticated IPC surface, so direct-write denial is enforced by the
-   OS, not just the API. (See the threat model's "deferred" section.)
-2. **Richer resources & effects** — beyond single config keys.
-3. **Intelligence integration** — plug a model into the proposer through the
+1. **Evidence ledger** — hash-linked receipts and observation-independence tests
+   (EVD-02, SEC-015/016).
+2. **Governance registry** — versioned, immutable policy with amendment control
+   (GOV-01..03, SEC-019) and a capability attenuator (PRIV-01, SEC-020).
+3. **Richer resources & effects** — beyond single config keys, with a real
+   external-effect confirmer feeding the outcome resolver.
+4. **Intelligence integration** — plug a model into the proposer through the
    unprivileged interface, without changing its authority.
-4. **Memory & orchestration** — durable workflows, retrieval, context.
-5. **Formal reasoning & discovery** — independently checked proofs, evaluation.
+5. **Formal reasoning** — a real Lean/SMT check behind the existing dependency
+   preflight (T13).
+
+See [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md) for the exact done / partial /
+not-yet status against the full spec.
 
 The rule throughout: the smallest set of capabilities that delivers the value,
 and every security guarantee earns its place through execution and evidence.
