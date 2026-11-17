@@ -30,6 +30,23 @@ D1 also changed behavior that an earlier test had blessed: a crash mid-transacti
 used to "complete on retry". It is now **blocked**, because from durable state it
 is indistinguishable from D1. That test was changed deliberately, not loosened.
 
+**Independent recheck at `89d0ccb`** (as reported by the reviewer): D1–D3 regression
+tests pass; D4's connection-handling is now independently reproduced via the
+`socketpair` tests; D4's bound-socket loop stays skipped (environment denies
+socket creation); the two-uid OS-isolation tests stay skipped (no root). So D4 is
+**partially reproduced** — handler logic verified, loop pending a socket-capable
+environment.
+
+The reviewer also raised two accuracy points, now fixed and tested in
+`test_recovery_replacement`:
+- `set` is idempotent only absent an intervening write; a replacement must target
+  the presently-intended effect with a current-state precondition, not replay the
+  old assignment verbatim.
+- `COMMITTED` means the redemption transaction committed, not that the mutation
+  applied (a rejected precondition also commits a record). `rolled_back` is the
+  loss of a known committed redemption; its receipt distinguishes applied from
+  rejected.
+
 ## Adversarial regression tests (SEC-###)
 
 | ID | Claim | Status | Test |
@@ -103,15 +120,16 @@ there is still no honest single "N of 10":
 - **Item 2 (OS isolation)** has never been independently verified: the two-uid
   tests need root and two non-root users, and the reviewer's environment has
   neither.
-- **D4 (malformed IPC)** is code-inspected only by the reviewer; the live test was
-  blocked because their environment denies Unix-socket creation. The suite now
-  carries a socketpair-based variant of that test and skips (as
-  `BLOCKED_ENVIRONMENT`) rather than failing in setup, but **a skip verifies
-  nothing**: in a socket-denying environment D4 stays unverified until it runs
-  somewhere that allows sockets.
+- **D4 (malformed IPC)** is now **partially reproduced** independently. At
+  `89d0ccb` the reviewer ran the `socketpair` handler tests (no bind needed) and
+  all four passed: malformed input, subsequent valid execution, timeout, uid
+  refusal. The bound-socket *loop* test stays skipped where the environment denies
+  socket creation — a skip verifies nothing, so the loop remains pending a
+  socket-capable environment.
 
-Reviewer recheck at `353f245`, as reported: 46 passed, 3 skipped (OS isolation),
-1 failed in IPC test *setup* (not an application regression).
+Reviewer recheck at `353f245`: 46 passed, 3 skipped, 1 failed in IPC test *setup*.
+Reviewer recheck at `89d0ccb`: 53 passed, 4 skipped, 0 failed (setup fixed; D4
+handler logic reproduced). Both as reported by the reviewer.
 
 ## Corrections to earlier summaries
 

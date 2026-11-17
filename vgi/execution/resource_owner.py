@@ -127,12 +127,16 @@ class ResourceOwner:
         * ``blocked``     — reserved (PENDING), no local record. Prior execution is
           undeterminable: it may never have committed, or it may have committed and
           then been rolled back. Retries report UNKNOWN.
-        * ``rolled_back`` — marked COMMITTED, no local record. The grant definitely
-          committed at some point and the resource has since lost it. Retries are
-          refused.
+        * ``rolled_back`` — a redemption transaction COMMITTED and the local record
+          is gone. "Committed" means the transaction committed, NOT that the
+          mutation applied: a rejected precondition also commits a redemption. This
+          list cannot distinguish applied from rejected (the coordination store does
+          not record the outcome); consult the grant's receipt in the evidence
+          store. Retries are refused.
 
-        Neither list is cleared by issuing a new grant; see THREAT_MODEL.md,
-        "Recovering a blocked grant".
+        Neither list is cleared by issuing a new grant, and a replacement should
+        authorize the presently-intended effect with a current-state precondition,
+        not a verbatim re-run. See THREAT_MODEL.md, "Recovering a blocked grant".
         """
         local = {r[0] for r in self._conn.execute("SELECT grant_id FROM redemptions")}
         return {

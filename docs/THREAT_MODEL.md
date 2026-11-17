@@ -164,8 +164,18 @@ human decision followed by a **new** grant. The service reports such attempts as
 - `blocked` — reserved, no local record. Genuinely undeterminable: the attempt may
   never have committed, or may have committed and been rolled back. Retries report
   `UNKNOWN`.
-- `rolled_back` — marked `COMMITTED`, no local record. Definite: it committed and
-  the resource has since lost it. Retries are `REFUSED`.
+- `rolled_back` — a redemption transaction for this grant is **known to have
+  committed** (`COMMITTED` in the coordination store) and the resource no longer
+  has its local record. Retries are `REFUSED`.
+
+  Note what `COMMITTED` does and does not mean: it means the *redemption
+  transaction* committed, **not** that the requested mutation applied. A grant
+  whose precondition failed also commits a redemption record (outcome `rejected`,
+  no mutation). So a `rolled_back` entry is the loss of a known committed
+  redemption, which may have been `applied` *or* `rejected`. The coordination store
+  does not record which; to tell them apart, consult that grant's receipt in the
+  evidence store (the owner's own copy was in the rolled-back resource DB and is
+  gone).
 
 (`test_crash_recovery`: clean commit → both empty; ambiguous crash → `blocked`;
 commit then restore → `rolled_back`.)
@@ -185,14 +195,26 @@ and nothing in the system treats it as such:
 So before issuing a replacement, an operator should compare the receipt store, the
 ledger and any downstream observers, and record the decision somewhere durable.
 
+**A replacement authorizes the presently-intended effect, not a re-run of the
+old one.** Re-issuing the original grant's effect verbatim is unsafe even for
+`set`: `set` is idempotent only *absent an intervening write*. If another
+authorized grant changed the key after the blocked attempt, blindly replaying the
+old assignment overwrites that newer value. The replacement should name the effect
+that is intended *now*, and should carry a **current-state precondition**
+(compare-and-set) so that if the state is not what the operator believed, the
+replacement is `rejected` rather than silently clobbering it. Both the hazard and
+the precondition guard are shown in `test_recovery_replacement`.
+
 **Not built, stated so it is not assumed:**
 
 - Nothing links a replacement grant to the blocked one (no `supersedes`), and there
   is no operation to formally close a `blocked` entry; entries stay listed.
-- This is tolerable today only because the sole effect type is `set`, whose
-  re-application yields the same final value. For any non-idempotent effect (an
-  increment, an external side effect) a replacement grant can double-apply the
-  real-world consequence. That needs its own design before such effects exist.
+- The coordination store does not record a redemption's `applied`/`rejected`
+  outcome, so `unresolved_grants` cannot distinguish them; that needs the receipt.
+- Even with a precondition, the one effect type is `set`. A non-idempotent effect
+  (an increment, an external side effect) can still double-apply its real-world
+  consequence across a replacement, and a compare-and-set on a single key does not
+  fix that. Such effects need their own design before they exist.
 
 ### The precondition, proven both ways
 
