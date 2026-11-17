@@ -40,7 +40,7 @@ earlier research. These are the bar a clean rebuild has to clear:
 | **OS-enforced isolation** — kernel denies direct DB/WAL/credential access; grant-gated IPC only | `test_os_isolation` (needs root; skips otherwise) |
 | **Concurrent redemption** — many owners, one effect | `test_concurrency` |
 | **Revocation** — atomic with the reservation (the authorization cutoff); late revocations reported `too_late` | `test_revocation` |
-| **IPC robustness** — malformed or stalled requests from an allowed peer can't stop the service (runs without root) | `test_ipc_robustness` |
+| **IPC robustness** — malformed or stalled requests from an allowed peer can't stop the service (no root; handler logic needs no socket bind; skips as `BLOCKED_ENVIRONMENT` if sockets are denied) | `test_ipc_robustness` |
 | **Fail-closed** — policy/chronicle failure permits no effect | `test_failclosed` |
 | **Honest uncertainty** — unconfirmable external effect is `UNKNOWN`, never false `COMMITTED` | `test_outcomes` |
 | **No unchecked "proof"** — a missing checker yields `BLOCKED_DEPENDENCY`, not a pass | `test_verification` |

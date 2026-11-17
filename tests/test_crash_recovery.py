@@ -148,6 +148,54 @@ class CrashRecoveryTest(unittest.TestCase):
         self.assertIsNone(owner.current_value("log.level"))
         owner.close()
 
+    # -- operator visibility: blocked grants can be found --------------------
+
+    def _gid(self) -> str:
+        return self.grant.grant["grant_id"]
+
+    def test_unresolved_grants_is_empty_after_a_clean_commit(self) -> None:
+        owner = self._owner()
+        owner.redeem_and_apply(self.request)
+        self.assertEqual(owner.unresolved_grants(), {"blocked": [], "rolled_back": []})
+        owner.close()
+
+    def test_ambiguous_crash_is_listed_as_blocked(self) -> None:
+        self._assert_killed(self._redeem_then_crash_at("mid_transaction"))
+        owner = self._owner()
+        self.assertEqual(
+            owner.unresolved_grants(), {"blocked": [self._gid()], "rolled_back": []}
+        )
+        owner.close()
+
+    def test_commit_then_restore_is_listed_as_rolled_back_not_blocked(self) -> None:
+        # Here the coordination store KNOWS the grant committed (COMMITTED), so the
+        # loss is definite — a different, better-understood state than "blocked".
+        self._owner().close()
+        snap = os.path.join(self.workdir, "snap")
+        os.makedirs(snap)
+        for f in self._db_files():
+            if os.path.exists(f):
+                shutil.copy2(f, snap)
+
+        owner = self._owner()
+        owner.redeem_and_apply(self.request)  # clean commit, marked COMMITTED
+        owner.close()
+
+        for f in self._db_files():
+            if os.path.exists(f):
+                os.remove(f)
+        for name in os.listdir(snap):
+            shutil.copy2(os.path.join(snap, name), self.workdir)
+
+        owner = self._owner()
+        self.assertEqual(
+            owner.unresolved_grants(), {"blocked": [], "rolled_back": [self._gid()]}
+        )
+        with self.assertRaises(AuthorizationError) as ctx:
+            owner.redeem_and_apply(self.request)
+        self.assertNotIsInstance(ctx.exception, RecoveryBlocked)  # refused, not UNKNOWN
+        owner.close()
+
     # -- reviewer-reported defect: crash + snapshot restore -----------------
 
     def test_crash_after_commit_then_snapshot_restore_does_not_replay(self) -> None:

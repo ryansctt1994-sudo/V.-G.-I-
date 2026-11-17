@@ -156,6 +156,44 @@ re-executed automatically. The cost is real — an honest crash mid-transaction
 human decision followed by a **new** grant. The service reports such attempts as
 `UNKNOWN`, not `REFUSED`, because the system does not know what happened.
 
+### Recovering a blocked grant
+
+**Finding them.** `ResourceOwner.unresolved_grants()` is the operator's worklist
+(read-only):
+
+- `blocked` — reserved, no local record. Genuinely undeterminable: the attempt may
+  never have committed, or may have committed and been rolled back. Retries report
+  `UNKNOWN`.
+- `rolled_back` — marked `COMMITTED`, no local record. Definite: it committed and
+  the resource has since lost it. Retries are `REFUSED`.
+
+(`test_crash_recovery`: clean commit → both empty; ambiguous crash → `blocked`;
+commit then restore → `rolled_back`.)
+
+**What a new grant means.** Issuing a new grant after investigation authorizes a
+**new attempt**. It is **not** evidence that the original attempt never happened,
+and nothing in the system treats it as such:
+
+- The original may have taken effect and been *seen*: an acknowledgement may have
+  been delivered, a receipt filed with the evidence store, or another process may
+  have read the value before the restore. After commit-then-restore the evidence
+  store can hold a genuine signed `applied` receipt for the original grant that the
+  resource no longer reflects; the witness correctly reports that as a mismatch.
+- For `rolled_back` grants the original *did* commit — that is known, not inferred.
+- For `blocked` grants it stays unknown even after the new grant is issued.
+
+So before issuing a replacement, an operator should compare the receipt store, the
+ledger and any downstream observers, and record the decision somewhere durable.
+
+**Not built, stated so it is not assumed:**
+
+- Nothing links a replacement grant to the blocked one (no `supersedes`), and there
+  is no operation to formally close a `blocked` entry; entries stay listed.
+- This is tolerable today only because the sole effect type is `set`, whose
+  re-application yields the same final value. For any non-idempotent effect (an
+  increment, an external side effect) a replacement grant can double-apply the
+  real-world consequence. That needs its own design before such effects exist.
+
 ### The precondition, proven both ways
 
 - Coordination store independent → replay refused

@@ -131,6 +131,16 @@ class FreshnessAuthority:
         ).fetchone()
         return row[0] if row else None
 
+    def grants_in_state(self, state: str) -> list:
+        """Grant ids currently in `state`, oldest first."""
+        return [
+            r[0]
+            for r in self._conn.execute(
+                "SELECT grant_id FROM grants WHERE state = ? ORDER BY updated_at, grant_id",
+                (state,),
+            )
+        ]
+
     def is_consumed(self, grant_id: str) -> bool:
         """True once a grant has been reserved (PENDING) or committed."""
         return self.state(grant_id) is not None

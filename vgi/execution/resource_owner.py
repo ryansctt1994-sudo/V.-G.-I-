@@ -119,6 +119,29 @@ class ResourceOwner:
                 reconciled += 1
         return reconciled
 
+    def unresolved_grants(self) -> dict:
+        """Grants the coordination store knows about that have no local record.
+
+        This is the operator's worklist after a crash or a restore. Read-only.
+
+        * ``blocked``     — reserved (PENDING), no local record. Prior execution is
+          undeterminable: it may never have committed, or it may have committed and
+          then been rolled back. Retries report UNKNOWN.
+        * ``rolled_back`` — marked COMMITTED, no local record. The grant definitely
+          committed at some point and the resource has since lost it. Retries are
+          refused.
+
+        Neither list is cleared by issuing a new grant; see THREAT_MODEL.md,
+        "Recovering a blocked grant".
+        """
+        local = {r[0] for r in self._conn.execute("SELECT grant_id FROM redemptions")}
+        return {
+            "blocked": [g for g in self._freshness.grants_in_state(PENDING) if g not in local],
+            "rolled_back": [
+                g for g in self._freshness.grants_in_state(COMMITTED) if g not in local
+            ],
+        }
+
     # -- the sole public mutation entry point -------------------------------
 
     def redeem_and_apply(self, request: dict) -> SignedReceipt:

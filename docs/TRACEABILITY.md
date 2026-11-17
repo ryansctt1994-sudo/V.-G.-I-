@@ -24,7 +24,7 @@ original probe:
 | D1 | Commit → SIGKILL before freshness advance → restore pre-commit resource snapshot → restart: grant applied **again** (new receipt). | Freshness was written only after the commit; a crash lost it, and startup recovery cannot rebuild a redemption the snapshot erased. | Reservation (`PENDING`) in the coordination store **before** the commit, `COMMITTED` after; `PENDING` + no local record is **blocked / UNKNOWN**, never re-executed. | `test_crash_recovery::test_crash_after_commit_then_snapshot_restore_does_not_replay` |
 | D2 | Witness accepted a valid receipt for effect A as trustworthy against effect B when values matched. | `reconcile` checked signature and value, not effect identity. | Receipt must match the checked effect's identity and claim `applied`. | `test_negative::test_receipt_for_a_different_effect_is_not_trustworthy` |
 | D3 | Revocation landing after the early check but before the transaction still applied. | Revocation was checked outside the transaction, with no defined cutoff. | Revocation moved into the coordination store and checked **atomically with the reservation** — the declared cutoff. | `test_revocation::test_revoke_racing_after_early_checks_is_still_honored` |
-| D4 | A JSON array from an allowed peer raised `AttributeError` and terminated the service loop. | No envelope validation; the loop caught only two exception types. | Strict envelope validation; every per-connection failure contained; per-connection timeout. | `test_ipc_robustness` |
+| D4 | A JSON array from an allowed peer raised `AttributeError` and terminated the service loop. | No envelope validation; the loop caught only two exception types. | Strict envelope validation; every per-connection failure contained in `serve_connection`; per-connection timeout. | `test_ipc_robustness` — handler logic over `socketpair` (no bind needed) plus the real loop on a bound socket. Mutation-checked: reverting to the D4 behaviour makes the socketpair tests fail. |
 
 D1 also changed behavior that an earlier test had blessed: a crash mid-transaction
 used to "complete on retry". It is now **blocked**, because from durable state it
@@ -47,7 +47,7 @@ is indistinguishable from D1. That test was changed deliberately, not loosened.
 | SEC-011 | Forge ALLOW without a grant | ✓ | `test_negative::...request_without_grant`, `...forged_grant` |
 | SEC-012 | Policy service unavailable | ✓ | `test_failclosed::...policy_unavailable_blocks_grant_issuance` |
 | SEC-013 | Chronicle write fails | ✓ | `test_failclosed::...chronicle_write_failure_rolls_back_effect` |
-| SEC-014 | Crash after effect, before ack | ✓ | `test_crash_recovery` — real SIGKILL at before/after-reserve/mid/after-commit + restart; ambiguous cases block as UNKNOWN |
+| SEC-014 | Crash after effect, before ack | ✓ | `test_crash_recovery` — real SIGKILL at before/after-reserve/mid/after-commit + restart; ambiguous cases block as UNKNOWN; `unresolved_grants()` lists them for an operator |
 | SEC-015 | Alter a receipt / ledger, recompute hash | ✓* | `test_ledger` (tamper, delete, reorder; external checkpoint catches full rewrite). *Guarantee is conditional on an external anchor — see note below. |
 | SEC-016 | Forge matching receipt + observation | ◑ | `test_negative::...fabricated_receipt...` (signature); observation independence under common control ✗ |
 | SEC-017 | Verification command does not verify | ✓ | `test_verification::...non_verifying_command_is_not_verified` |
@@ -78,25 +78,40 @@ is indistinguishable from D1. That test was changed deliberately, not loosened.
 
 Two columns, because they are different claims. *Self-verified* = a test in this
 repo enforces it and passes in the author's (root) environment. *Independent* =
-what the review run at `7c8a75a` actually established.
+what the reviewer's runs actually established: first at `7c8a75a`, then a recheck
+at `353f245`. Recheck results are as reported by the reviewer; the author has not
+reproduced the reviewer's environment.
 
-| # | Item | Self-verified | Independent (review at `7c8a75a`) |
+| # | Item | Self-verified | Independent (reviewer: `7c8a75a`, recheck `353f245`) |
 |---|------|:---:|---|
 | 1 | Authorized protected write with exact-effect binding | ✓ | passed |
 | 2 | Unauthorized direct write denied (OS-enforced) | ✓ (root only) | **not verified** — tests skipped without root |
 | 3 | Duplicate & concurrent redemption cannot duplicate effects | ✓* | passed (*local transactional resource) |
-| 4 | DB restoration cannot revive consumed grants | ✓ | **failed** (D1) → fixed here, needs re-run |
-| 5 | Revoked or modified grants fail under ordering contract | ✓ | **failed** (D3) → fixed here, needs re-run |
-| 6 | Crash / lost-ack outcomes reconcile correctly | ✓ | **failed** with rollback (D1) → fixed here, needs re-run |
+| 4 | DB restoration cannot revive consumed grants | ✓ | failed at `7c8a75a` (D1); **passed** reviewer's recheck probe at `353f245` |
+| 5 | Revoked or modified grants fail under ordering contract | ✓ | failed at `7c8a75a` (D3); **passed** reviewer's recheck at `353f245` |
+| 6 | Crash / lost-ack outcomes reconcile correctly | ✓ | failed with rollback at `7c8a75a` (D1); **passed** reviewer's recheck at `353f245` — ambiguity now blocks (conditional on the coordination store surviving) |
 | 7 | Chronicle / policy failures do not silently permit effects | ✓ | passed |
-| 8 | Independent observer distinguishes real effects from fabricated records | ✓ | **failed** (D2) → fixed here, needs re-run |
+| 8 | Independent observer distinguishes real effects from fabricated records | ✓ | failed at `7c8a75a` (D2); **passed** reviewer's recheck at `353f245` |
 | 9 | Mandatory verification deps execute or report BLOCKED_DEPENDENCY | ✓ | passed |
 | 10 | Separate operator reproduces frozen tests | — | partial: one non-root run; root tests not run |
 
-There is no honest single "N of 10" number right now. Items 4, 5, 6 and 8 were
-claimed done and **failed** independent probing; they are fixed in the code but
-are not done until a re-run confirms them. Item 2 has never been independently
-verified.
+Items 4, 5, 6 and 8 were claimed done and **failed** independent probing at
+`7c8a75a`; the reviewer's recheck at `353f245` reproduced fixes for D1–D3 (so these
+four now have an independent pass, for those probes). Two items remain open and
+there is still no honest single "N of 10":
+
+- **Item 2 (OS isolation)** has never been independently verified: the two-uid
+  tests need root and two non-root users, and the reviewer's environment has
+  neither.
+- **D4 (malformed IPC)** is code-inspected only by the reviewer; the live test was
+  blocked because their environment denies Unix-socket creation. The suite now
+  carries a socketpair-based variant of that test and skips (as
+  `BLOCKED_ENVIRONMENT`) rather than failing in setup, but **a skip verifies
+  nothing**: in a socket-denying environment D4 stays unverified until it runs
+  somewhere that allows sockets.
+
+Reviewer recheck at `353f245`, as reported: 46 passed, 3 skipped (OS isolation),
+1 failed in IPC test *setup* (not an application regression).
 
 ## Corrections to earlier summaries
 

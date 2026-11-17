@@ -142,6 +142,25 @@ class OwnerService:
             },
         )
 
+    def serve_connection(self, conn: socket.socket, *, timeout: float | None = None) -> None:
+        """Serve exactly one connection and contain every failure. Never raises.
+
+        This is the unit `serve_forever` loops over. It is separate so the
+        per-connection behaviour (envelope validation, containment, timeout) can
+        be exercised over a `socket.socketpair()` in environments that forbid
+        binding a socket path.
+        """
+        conn.settimeout(_CONN_TIMEOUT if timeout is None else timeout)
+        try:
+            self._handle(conn)
+        except Exception:
+            pass  # contained: one bad connection never stops the service
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
     def serve_forever(self, stop_event=None) -> None:
         """Serve until `stop_event` (a threading.Event) is set, or forever.
 
@@ -162,13 +181,7 @@ class OwnerService:
                     conn, _ = srv.accept()
                 except socket.timeout:
                     continue
-                conn.settimeout(_CONN_TIMEOUT)
-                try:
-                    self._handle(conn)
-                except Exception:
-                    pass  # contained: one bad connection never stops the service
-                finally:
-                    conn.close()
+                self.serve_connection(conn)
         finally:
             srv.close()
             if os.path.exists(self._sock_path):
