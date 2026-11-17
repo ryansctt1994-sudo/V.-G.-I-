@@ -11,4 +11,5 @@ from vgi.contracts.schema import (  # noqa: F401
     SignedReceipt,
     canonical,
     effect_identity,
+    validate_effect,
 )

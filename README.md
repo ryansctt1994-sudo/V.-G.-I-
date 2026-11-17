@@ -43,6 +43,9 @@ earlier research. These are the bar a clean rebuild has to clear:
 | **Fail-closed** — policy/chronicle failure permits no effect | `test_failclosed` |
 | **Honest uncertainty** — unconfirmable external effect is `UNKNOWN`, never false `COMMITTED` | `test_outcomes` |
 | **No unchecked "proof"** — a missing checker yields `BLOCKED_DEPENDENCY`, not a pass | `test_verification` |
+| **Crash recovery** — real SIGKILL at before/mid/after-commit + restart; no partial effect, no double-apply | `test_crash_recovery` |
+| **Tamper-evident ledger** — hash chain detects alteration/delete/reorder; external checkpoint catches full rewrite | `test_ledger` |
+| **Input hardening** — effect surface rejects any smuggled path/descriptor field | `test_input_hardening` |
 
 Full claim-to-test mapping (including what is **not** yet built) is in
 [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md).
@@ -94,7 +97,8 @@ vgi/
   execution/    freshness, resource owner, broker,
                 owner_service + ipc (separate-UID + authenticated IPC),
                 outcome resolver                          (execution domain)
-  evidence/     durable receipts + independent witness    (assurance domain)
+  evidence/     durable receipts, independent witness,
+                hash-linked ledger (external-checkpoint)   (assurance domain)
   verification/ dependency preflight + fail-closed verifier
   crypto.py     Ed25519 signing primitives
   system.py     the one place that wires it all together
@@ -111,8 +115,10 @@ identity** with an **authenticated IPC** surface, so direct-write denial is
 enforced by the kernel, not just the API (`test_os_isolation`). The roadmap from
 here, each step earning its complexity through tests before the next is added:
 
-1. **Evidence ledger** — hash-linked receipts and observation-independence tests
-   (EVD-02, SEC-015/016).
+1. **Observation independence** — a witness on a *separate* trust boundary
+   (SEC-016, OBS-02). The hash-linked ledger is built, but it proves integrity
+   relative to an external checkpoint — it does **not** provide observation
+   independence; that is a different property.
 2. **Governance registry** — versioned, immutable policy with amendment control
    (GOV-01..03, SEC-019) and a capability attenuator (PRIV-01, SEC-020).
 3. **Richer resources & effects** — beyond single config keys, with a real

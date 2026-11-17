@@ -32,6 +32,20 @@ A secondary concern is **operational recovery gone wrong**: a database snapshot
 restored after a grant was spent, or drift/corruption of the resource behind the
 owner's back.
 
+### Outside the attacker model (what is NOT defended)
+
+These are explicit so no result is read as more than it is:
+
+- **A privileged host administrator / root / the kernel.** Anyone who can `setuid`
+  to the owner's identity, read its `0600` files as root, `ptrace` it, or replace
+  the kernel defeats the OS boundary. The isolation tests show a *less-privileged,
+  different-uid* requester being denied — nothing more. In particular, the
+  "root peer refused" result is an **application-level authorization check** in
+  the IPC layer (an allow-list of requester uids); it is **not** evidence of
+  protection against a host administrator, who would not need the socket at all.
+- **A trusted time source.** Grant expiry uses local wall-clock time.
+- **Availability / DoS, side channels, supply chain.** Out of scope for this slice.
+
 ## What is defended (and the test that shows it)
 
 1. **No authority by default.** A proposal carries no power. The resource owner
@@ -55,6 +69,37 @@ owner's back.
    drift between receipt and reality, or a fabricated receipt, is caught.
    → `test_witness_catches_drift_between_receipt_and_reality`,
    `test_fabricated_receipt_fails_signature_check`
+8. **Crashes leave no partial effect; lost acks don't double-apply.** Verified
+   with real process termination (SIGKILL) at explicit boundaries and a restart.
+   → `test_crash_recovery` (before / mid / after-commit + concurrent-retry)
+9. **No client-controlled path exists to substitute.** The effect surface is
+   validated and admits no path/descriptor field. → `test_input_hardening`
+
+### Audited input inventory (basis for the path-substitution claim)
+
+The claim "path/symlink substitution has no input to attack" rests on this
+enumeration of every input the owner acts on, not on a general assertion:
+
+| Input | Who controls it | Is it a path the owner opens? |
+|-------|-----------------|-------------------------------|
+| `effect` (resource, operation, key, value, precondition) | requester | no — logical names, validated shape |
+| `grant_token` | authority (signed) | no |
+| `request_id` | requester | no |
+| resource DB / freshness DB paths | owner, fixed at construction | yes, but not client-supplied |
+| socket path, keyfile path | owner/service, fixed | yes, but not client-supplied |
+| file descriptors over IPC | — | none passed (no `SCM_RIGHTS`) |
+
+If a future effect type introduces a client-influenced path, this table and the
+validator must be revisited; the claim is scoped to the current surface.
+
+### Concurrency guarantee is scoped to the transactional resource
+
+"At most one effect under concurrency" (`test_concurrency`, `test_crash_recovery`)
+is a property of the **local SQLite transactional resource**: the atomic
+redemption record under `BEGIN IMMEDIATE` is the exactly-once authority. An
+external, non-transactional effect is **not** covered by this and needs its own
+recovery guarantee; the `UNKNOWN` outcome (EXE-06) is how the system refuses to
+claim success it cannot confirm for such effects.
 
 ## The freshness invariant, stated precisely
 

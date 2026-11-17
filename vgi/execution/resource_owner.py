@@ -37,7 +37,13 @@ import time
 import uuid
 from typing import Any
 
-from vgi.contracts import Receipt, SignedReceipt, canonical, effect_identity
+from vgi.contracts import (
+    Receipt,
+    SignedReceipt,
+    canonical,
+    effect_identity,
+    validate_effect,
+)
 from vgi.crypto import KeyPair, VerifyKey
 from vgi.execution.freshness import FreshnessAuthority
 from vgi.governance.grants import GrantToken
@@ -60,12 +66,16 @@ class ResourceOwner:
         authority_verify_key: VerifyKey,
         freshness: FreshnessAuthority,
         revocation=None,
+        crash_hook=None,
     ):
         self._path = db_path
         self._key = executor_key
         self._authority = authority_verify_key
         self._freshness = freshness
         self._revocation = revocation  # optional RevocationRegistry (AUT-07)
+        # crash_hook(boundary: str) -> None. A test can pass a hook that hard-kills
+        # the process at a named boundary to exercise crash recovery for real.
+        self._crash_hook = crash_hook
         self._conn = sqlite3.connect(db_path, timeout=30)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=30000")
@@ -80,10 +90,34 @@ class ResourceOwner:
             ")"
         )
         self._conn.commit()
+        # Reconcile the independent freshness guard with what is durably committed
+        # here, in case a crash happened after a local commit but before freshness
+        # was advanced. Runs before this owner serves any request.
+        self.recover()
 
     @property
     def executor_verify_key(self) -> VerifyKey:
         return self._key.verify_key
+
+    def _crash(self, boundary: str) -> None:
+        if self._crash_hook is not None:
+            self._crash_hook(boundary)
+
+    def recover(self) -> int:
+        """Startup reconciliation: advance freshness for every locally committed
+        grant it does not yet know about. Returns the number reconciled.
+
+        This establishes the invariant the anti-rollback check relies on:
+        a grant marked consumed in freshness was, at some point, committed here.
+        """
+        rows = self._conn.execute("SELECT grant_id FROM redemptions").fetchall()
+        reconciled = 0
+        for (grant_id,) in rows:
+            if not self._freshness.is_consumed(grant_id):
+                # seq 0: we are only recording the consumption fact, not ordering.
+                self._freshness.consume(grant_id, 0)
+                reconciled += 1
+        return reconciled
 
     # -- the sole public mutation entry point -------------------------------
 
@@ -92,6 +126,13 @@ class ResourceOwner:
         token_dict = request.get("grant_token")
         if effect is None or token_dict is None:
             raise AuthorizationError("request must carry both effect and grant_token")
+
+        # Strict input validation: reject any malformed effect, including a
+        # smuggled path/descriptor field. There is no client-controlled path.
+        try:
+            validate_effect(effect)
+        except ValueError as e:
+            raise AuthorizationError(f"invalid effect: {e}")
 
         token = GrantToken.from_dict(token_dict)
         grant = token.grant
@@ -131,15 +172,33 @@ class ResourceOwner:
         if self._revocation is not None and self._revocation.is_revoked(grant_id):
             raise AuthorizationError("grant has been revoked")
 
-        # (3) Independent single-use gate. 'replay' here with no local record is
-        # the snapshot-rollback signature -> reject.
-        if self._freshness.consume(grant_id, int(grant["freshness_seq"])) == "replay":
+        # (3) Anti-rollback (SEC-007). freshness is advanced only AFTER a local
+        # commit (and reconciled on startup), so "consumed in freshness but absent
+        # from the local ledger" can only mean the local ledger was rolled back
+        # under us. Refuse.
+        if self._freshness.is_consumed(grant_id):
             raise AuthorizationError(
-                "grant already consumed (freshness authority); refusing replay"
+                "grant consumed per freshness authority but absent locally; "
+                "refusing replay across rollback"
             )
 
-        # (4) Apply under the resource transaction, with precondition check.
-        return self._apply_locked(effect, grant_id)
+        # Crash boundary: nothing has been written yet. A crash here leaves no
+        # effect and no committed receipt (scenario 1).
+        self._crash("before_transaction")
+
+        # (4) Apply the effect and record the receipt atomically. The local
+        # redemption record is the exactly-once authority and the source for
+        # idempotent retries.
+        signed = self._apply_locked(effect, grant_id)
+
+        # Crash boundary: the effect + receipt are durably committed, but freshness
+        # has not been advanced yet. A crash here is repaired by recover() on the
+        # next start; a same-process retry returns the stored receipt (scenario 3).
+        self._crash("after_commit")
+
+        # (5) Advance the independent anti-rollback guard.
+        self._freshness.consume(grant_id, int(grant["freshness_seq"]))
+        return signed
 
     # -- internals ----------------------------------------------------------
 
@@ -154,6 +213,15 @@ class ResourceOwner:
         cur = self._conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
         try:
+            # Concurrency-safe recheck inside the write lock: if a racing redeemer
+            # already recorded this grant, return its receipt and apply nothing.
+            dup = cur.execute(
+                "SELECT receipt_json FROM redemptions WHERE grant_id = ?", (grant_id,)
+            ).fetchone()
+            if dup is not None:
+                self._conn.commit()
+                return SignedReceipt(**json.loads(dup[0]))
+
             prior_row = cur.execute(
                 "SELECT value FROM config WHERE key = ?", (key,)
             ).fetchone()
@@ -186,6 +254,12 @@ class ResourceOwner:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, new_value),
             )
+
+            # Crash boundary: the effect is written but the surrounding
+            # transaction is NOT yet committed. A hard kill here must leave no
+            # partial effect (scenario 2) — SQLite discards the uncommitted WAL.
+            self._crash("mid_transaction")
+
             receipt = Receipt(
                 receipt_id=f"rcpt-{uuid.uuid4().hex[:12]}",
                 grant_id=grant_id,

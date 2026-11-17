@@ -83,6 +83,33 @@ class Effect:
         )
 
 
+_EFFECT_REQUIRED = {"resource", "operation", "key", "value"}
+_EFFECT_ALLOWED = _EFFECT_REQUIRED | {"precondition"}
+
+
+def validate_effect(effect: object) -> None:
+    """Strictly validate an effect's shape before it is trusted.
+
+    The request surface exposes NO filesystem path, symlink target, or file
+    descriptor — an effect names a logical resource and key, never a path the
+    resource owner would open. This validator enforces that: any unexpected
+    field (e.g. a smuggled "path"/"file"/"fd") is rejected, so path and symlink
+    substitution have no input to attack. Raises ValueError on any violation.
+    """
+    if not isinstance(effect, dict):
+        raise ValueError("effect must be an object")
+    keys = set(effect.keys())
+    missing = _EFFECT_REQUIRED - keys
+    if missing:
+        raise ValueError(f"effect missing required fields: {sorted(missing)}")
+    extra = keys - _EFFECT_ALLOWED
+    if extra:
+        raise ValueError(f"effect has unexpected fields: {sorted(extra)}")
+    for field_name in ("resource", "operation", "key"):
+        if not isinstance(effect[field_name], str):
+            raise ValueError(f"effect.{field_name} must be a string")
+
+
 def effect_identity(effect: dict) -> str:
     """Deterministic semantic identity of an effect."""
     import hashlib
