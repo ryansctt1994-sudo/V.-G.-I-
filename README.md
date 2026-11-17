@@ -33,17 +33,18 @@ earlier research. These are the bar a clean rebuild has to clear:
 |---|---|
 | **Direct-write denial** — no path to the resource without a valid grant | `test_no_ungated_mutation_method_exists`, `test_request_without_grant_is_denied` |
 | **Grant integrity** — forged, tampered, or wrong-effect grants are refused | `test_forged_grant_from_attacker_key_is_denied`, `test_tampered_grant_body_is_denied`, `test_grant_for_other_effect_cannot_authorize_this_one` |
-| **Replay resistance across snapshot restore** — a spent grant stays spent even if the resource DB is rolled back | `test_spent_grant_stays_spent_after_resource_rollback` |
+| **Replay resistance across snapshot restore** — a spent grant stays spent even if the resource DB is rolled back, including after a crash between commit and coordination | `test_spent_grant_stays_spent_after_resource_rollback`, `test_crash_after_commit_then_snapshot_restore_does_not_replay` |
 | *(why that works)* — the counter-example when freshness is **not** independent | `test_counterexample_rolling_back_freshness_too_resurrects_authority` |
-| **Receipt ≠ observation** — a signed receipt never substitutes for a direct read | `test_witness_catches_drift_between_receipt_and_reality`, `test_fabricated_receipt_fails_signature_check` |
+| **Receipt ≠ observation** — a signed receipt never substitutes for a direct read, and must be bound to the effect being checked | `test_witness_catches_drift_between_receipt_and_reality`, `test_fabricated_receipt_fails_signature_check`, `test_receipt_for_a_different_effect_is_not_trustworthy` |
 | **Idempotent recovery** — honest retries apply exactly once | `test_retry_of_same_grant_is_idempotent` |
 | **OS-enforced isolation** — kernel denies direct DB/WAL/credential access; grant-gated IPC only | `test_os_isolation` (needs root; skips otherwise) |
 | **Concurrent redemption** — many owners, one effect | `test_concurrency` |
-| **Revocation** — withdrawn authority fails under a declared ordering contract | `test_revocation` |
+| **Revocation** — atomic with the reservation (the authorization cutoff); late revocations reported `too_late` | `test_revocation` |
+| **IPC robustness** — malformed or stalled requests from an allowed peer can't stop the service (runs without root) | `test_ipc_robustness` |
 | **Fail-closed** — policy/chronicle failure permits no effect | `test_failclosed` |
 | **Honest uncertainty** — unconfirmable external effect is `UNKNOWN`, never false `COMMITTED` | `test_outcomes` |
 | **No unchecked "proof"** — a missing checker yields `BLOCKED_DEPENDENCY`, not a pass | `test_verification` |
-| **Crash recovery** — real SIGKILL at before/mid/after-commit + restart; no partial effect, no double-apply | `test_crash_recovery` |
+| **Crash recovery** — real SIGKILL at each boundary + restart; no partial effect, no double-apply; an undeterminable prior execution **blocks as `UNKNOWN`** instead of re-running | `test_crash_recovery` |
 | **Tamper-evident ledger** — hash chain detects alteration/delete/reorder; external checkpoint catches full rewrite | `test_ledger` |
 | **Input hardening** — effect surface rejects any smuggled path/descriptor field | `test_input_hardening` |
 
@@ -63,9 +64,9 @@ Full claim-to-test mapping (including what is **not** yet built) is in
   └────────────┘            └──────┬───────┘   effect-  │  grant)      │
                                    │           bound     └──────┬───────┘
                             ┌──────▼───────┐                    │ receipt
-                            │  Freshness   │◀── consume ────────┤
-                            │  Authority   │   (independent      │
-                            │ (independent │    durability)      ▼
+                            │ Coordination │◀─ reserve/commit ──┤
+                            │    store     │   (outside the      │
+                            │ (independent │  rollback boundary) ▼
                             │  store)      │            ┌──────────────┐
                             └──────────────┘            │   Witness    │
                                                         │ (independent │
@@ -79,8 +80,9 @@ Three trust domains, and the key distribution **is** the boundary:
 - The **resource owner** and **witness** hold only the authority's *public* key.
 - The **resource owner** signs receipts with its own key; the **witness** holds
   only *its* public key.
-- The **freshness authority** and the **resource database** are separate stores
-  with independent durability.
+- The **coordination store** (reservation, commitment, revocation) and the
+  **resource database** are separate stores; restoring the resource from a
+  snapshot must not restore the coordination store.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
 [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for the full design, the explicit
@@ -93,8 +95,9 @@ deferred to production hardening.
 vgi/
   contracts/    versioned schemas, canonical encoding, effect identity, outcomes
   intelligence/ untrusted proposer (where a model plugs in later)
-  governance/   policy, grant issuance, revocation       (authorization domain)
-  execution/    freshness, resource owner, broker,
+  governance/   policy, grant issuance                    (authorization domain)
+  execution/    coordination store (reserve/commit/revoke),
+                resource owner, broker,
                 owner_service + ipc (separate-UID + authenticated IPC),
                 outcome resolver                          (execution domain)
   evidence/     durable receipts, independent witness,

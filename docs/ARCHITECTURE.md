@@ -23,7 +23,8 @@ capability never gives it more authority, because authority lives elsewhere.
 - **Execution** (`vgi.execution`): `ResourceOwner` holds the protected resource
   and is its only mutator. It applies an effect only when presented with a valid,
   unconsumed grant bound to that exact effect. `FreshnessAuthority` is the
-  independent single-use gate.
+  independent **coordination store** — reservation, commitment and revocation
+  state, kept outside the resource's rollback boundary.
 
 These are grouped as one domain because both are "privileged," but they hold
 *different* keys and *different* stores; the authority can sign grants but does
@@ -63,28 +64,35 @@ signs the exact same bytes.
 3. **Issue.** `GrantAuthority.issue` signs a `Grant`, stamping it with the next
    sequence from the `FreshnessAuthority`.
 4. **Redeem.** `ResourceOwner.redeem_and_apply`:
-   - verifies signature, authority identity, and expiry;
-   - checks the requested effect identity equals the grant's;
-   - returns the stored receipt if this grant is already in its local ledger
-     (idempotent retry);
-   - otherwise asks `FreshnessAuthority.consume` — `replay` with no local record
-     is the rollback signature and is refused;
+   - validates the effect shape, verifies signature, authority identity, expiry,
+     and that the requested effect identity equals the grant's — before writing
+     anything;
+   - under the resource write lock: returns the stored receipt if this grant is
+     already in the local ledger (idempotent retry);
+   - otherwise **reserves** the grant in the coordination store, atomically with
+     the revocation check (the authorization cutoff). An existing `COMMITTED`
+     reservation with no local record means the resource was rolled back →
+     refused; an existing `PENDING` one means prior execution is undeterminable →
+     `RecoveryBlocked` (`UNKNOWN`);
    - checks the precondition and applies the effect **and** records redemption in
-     a single resource-DB transaction;
+     a single resource-DB transaction, then marks the grant `COMMITTED`;
    - signs and returns a receipt.
+   The full classification table and the reasoning are in THREAT_MODEL.md.
 5. **File & witness.** The `Broker` stores the receipt and asks the `Witness` to
-   `reconcile`: verify the receipt's signature *and* compare its claim against a
-   fresh independent read. `TransactionResult.verified` is true only when the
-   effect applied and reality independently confirms it.
+   `reconcile`: the receipt must be authentic, bound to *this* effect's identity
+   with an `applied` outcome, and agree with a fresh independent read.
+   `TransactionResult.verified` is true only when all of that holds.
 
 ## Invariants
 
 - **Effect binding.** The only effect the resource owner will apply is the one
   whose identity matches the grant. (`test_grant_for_other_effect_...`,
   `test_tampered_grant_body_is_denied`)
-- **Single use with independent durability.** A grant is consumed exactly once,
-  and "consumed" is remembered in a store independent of the resource DB.
-  (`test_spent_grant_stays_spent_after_resource_rollback`)
+- **At most once, across crashes and resource rollback.** Reservation before
+  commit + commitment after, in a store independent of the resource DB; the
+  ambiguous case blocks rather than re-executes.
+  (`test_spent_grant_stays_spent_after_resource_rollback`,
+  `test_crash_after_commit_then_snapshot_restore_does_not_replay`)
 - **Idempotent recovery.** Re-presenting a grant whose effect already applied
   returns the same receipt and never re-applies. (`test_retry_of_same_grant_...`)
 - **Observation over assertion.** Verification trusts a direct read of the

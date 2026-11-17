@@ -11,6 +11,7 @@ from vgi.execution.freshness import FreshnessAuthority  # noqa: F401
 from vgi.execution.owner_service import OwnerService, build_owner  # noqa: F401
 from vgi.execution.resource_owner import (  # noqa: F401
     AuthorizationError,
+    RecoveryBlocked,
     ResourceOwner,
     SignedReceipt,
 )

@@ -51,23 +51,24 @@ class FailClosedTest(unittest.TestCase):
 
     def test_chronicle_write_failure_rolls_back_effect(self) -> None:
         # SEC-013: if the redemption ("chronicle") record cannot be written, the
-        # effect must not commit. Simulate by removing the redemptions table so
-        # the record INSERT fails mid-transaction.
+        # effect must not commit. A trigger aborts only the record INSERT, so the
+        # failure happens AFTER the effect was written inside the transaction.
         authority = GrantAuthority(self.authority_key, default_config_policy(), self.freshness)
         proposal = self.proposer.propose_config_change("log.level", "debug")
         grant = authority.issue(proposal)
+        request = {"effect": proposal.effect, "grant_token": grant.to_dict()}
 
-        # Break the chronicle out-of-band.
         side = sqlite3.connect(self.resource_db, timeout=30)
         side.execute("PRAGMA busy_timeout=30000")
-        side.execute("DROP TABLE redemptions")
+        side.execute(
+            "CREATE TRIGGER chronicle_down BEFORE INSERT ON redemptions "
+            "BEGIN SELECT RAISE(ABORT, 'chronicle unavailable'); END"
+        )
         side.commit()
         side.close()
 
-        with self.assertRaises(sqlite3.OperationalError):
-            self.owner.redeem_and_apply(
-                {"effect": proposal.effect, "grant_token": grant.to_dict()}
-            )
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.owner.redeem_and_apply(request)
 
         # No unaccounted commit: a fresh connection sees the value unchanged.
         check = sqlite3.connect(self.resource_db, timeout=30)
@@ -76,6 +77,13 @@ class FailClosedTest(unittest.TestCase):
         ).fetchone()
         check.close()
         self.assertIsNone(row)
+
+        # The grant was reserved before the failure, so it is now blocked: a
+        # retry is not silently re-executed, even once the chronicle recovers.
+        from vgi.execution.resource_owner import RecoveryBlocked
+
+        with self.assertRaises(RecoveryBlocked):
+            self.owner.redeem_and_apply(request)
 
 
 if __name__ == "__main__":

@@ -60,20 +60,30 @@ These are explicit so no result is read as more than it is:
    → `test_tampered_grant_body_is_denied`
 4. **A grant authorizes one effect only.** Presenting a valid grant alongside a
    different effect is refused. → `test_grant_for_other_effect_cannot_authorize_this_one`
-5. **Replay is refused, even across a snapshot restore of the resource DB.** The
-   freshness authority remembers the grant was spent, independently of the
-   resource store. → `test_spent_grant_stays_spent_after_resource_rollback`
+5. **Replay is refused, even across a snapshot restore of the resource DB —
+   including after a crash between commit and coordination.** The coordination
+   store (outside the resource's rollback boundary) records a reservation before
+   the commit and the commitment after it. → `test_spent_grant_stays_spent_after_resource_rollback`,
+   `test_crash_after_commit_then_snapshot_restore_does_not_replay`
 6. **Honest retries are idempotent.** Exactly-once application under retry.
    → `test_retry_of_same_grant_is_idempotent`
-7. **A receipt is never proof on its own.** The witness reads reality directly;
-   drift between receipt and reality, or a fabricated receipt, is caught.
-   → `test_witness_catches_drift_between_receipt_and_reality`,
-   `test_fabricated_receipt_fails_signature_check`
-8. **Crashes leave no partial effect; lost acks don't double-apply.** Verified
-   with real process termination (SIGKILL) at explicit boundaries and a restart.
-   → `test_crash_recovery` (before / mid / after-commit + concurrent-retry)
+7. **A receipt is never proof on its own.** The witness requires a valid
+   signature, a receipt bound to *this* effect's identity with an `applied`
+   outcome, and agreement with a direct read. → `test_witness_catches_drift_between_receipt_and_reality`,
+   `test_fabricated_receipt_fails_signature_check`,
+   `test_receipt_for_a_different_effect_is_not_trustworthy`
+8. **Crashes leave no partial effect; lost acks don't double-apply; ambiguous
+   crashes block.** Verified with real process termination (SIGKILL) at explicit
+   boundaries and a restart. → `test_crash_recovery`
 9. **No client-controlled path exists to substitute.** The effect surface is
    validated and admits no path/descriptor field. → `test_input_hardening`
+10. **Revocation honors an explicit cutoff.** The revocation check and the
+    reservation are one atomic transaction; a revocation that races the early
+    checks is still honored, one after the cutoff is reported `too_late`.
+    → `test_revocation`
+11. **A malformed request from an allowed peer cannot stop the service.** Every
+    per-connection failure is contained; stalled peers time out.
+    → `test_ipc_robustness`
 
 ### Audited input inventory (basis for the path-substitution claim)
 
@@ -101,36 +111,72 @@ external, non-transactional effect is **not** covered by this and needs its own
 recovery guarantee; the `UNKNOWN` outcome (EXE-06) is how the system refuses to
 claim success it cannot confirm for such effects.
 
-## The freshness invariant, stated precisely
+## The combined crash-and-rollback invariant, stated precisely
 
-> A consumed grant remains consumed across the supported recovery scenarios.
+> A grant's effect is applied at most once, across crashes at any boundary and
+> restoration of the resource store from any earlier snapshot — provided the
+> coordination store is not itself rolled back.
 
-This holds **only because the freshness store has durability independent of the
-resource store.** If both are rolled back together, authority is resurrected —
-which is not a bug in the code but a violation of the invariant's precondition.
-We prove this both ways:
+### The protocol
 
-- Independent freshness → replay refused (`test_spent_grant_stays_spent_...`).
-- Freshness rolled back too → replay succeeds
+The coordination store (`vgi/execution/freshness.py`) sits **outside** the
+resource's rollback boundary. Under the resource write lock, the owner:
+
+1. returns the stored receipt if a local redemption record exists;
+2. **reserves** the grant in the coordination store (`PENDING`) — atomically with
+   the revocation check; this is the authorization cutoff;
+3. applies the effect and writes the redemption record in **one** resource
+   transaction, and commits;
+4. **marks** the grant `COMMITTED` in the coordination store.
+
+`recover()` at startup marks `COMMITTED` every grant that has a local record
+(repairing a crash between 3 and 4).
+
+### How every retry is classified
+
+| Coordination | Local record | Meaning | Result |
+|---|---|---|---|
+| none | none | never attempted | reserve and apply |
+| any | present | committed here | stored receipt (idempotent) |
+| `COMMITTED` | absent | resource rolled back after commit | refused |
+| `PENDING` | absent | crashed before commit **or** committed then rolled back | **blocked — `UNKNOWN`** |
+
+### Why the last row blocks instead of guessing
+
+A write made only *after* the commit can be lost to a crash; a write made only
+*before* it cannot prove the commit happened. With both stores intact, a
+`PENDING` grant with no local record is genuinely ambiguous — and re-executing it
+is exactly the defect found in review at `7c8a75a` (commit → crash before the
+coordination write → restore the pre-commit snapshot → the grant applied again).
+Moving the coordination write earlier alone would only move the gap.
+
+So the system chooses **safety over liveness**: an ambiguous grant is never
+re-executed automatically. The cost is real — an honest crash mid-transaction
+(e.g. power loss) leaves that grant blocked, and recovery is an investigated,
+human decision followed by a **new** grant. The service reports such attempts as
+`UNKNOWN`, not `REFUSED`, because the system does not know what happened.
+
+### The precondition, proven both ways
+
+- Coordination store independent → replay refused
+  (`test_spent_grant_stays_spent_after_resource_rollback`,
+  `test_crash_after_commit_then_snapshot_restore_does_not_replay`).
+- Coordination store rolled back together with the resource → the spent grant
+  becomes spendable again
   (`test_counterexample_rolling_back_freshness_too_resurrects_authority`).
 
-In production the freshness authority is a separate service, a replicated log, or
+In production the coordination store is a separate service, a replicated log, or
 a hardware monotonic counter / TPM — something whose state does not travel with a
-resource-DB snapshot.
+resource-DB snapshot. This repo models it as a separate file; the independence of
+its *durability* is an assumption the tests make explicit, not something a file
+can enforce.
 
 ## What is deferred (honest limitations)
 
-This is an **in-process reference implementation**. It models the trust
-boundaries at the API surface and with separate keys and separate stores. It does
-**not yet** enforce them at the operating-system level. Specifically:
-
-- **Process / UID isolation.** In production the resource owner runs under its
-  own OS identity with the resource DB owned `0600`, reachable only through an
-  authenticated IPC surface, so that no other process — including a compromised
-  intelligence domain — can open the file directly. Here, Python objects share a
-  process; a caller with the interpreter could reach a private attribute. The
-  negative tests assert the *designed* boundary (no public ungated mutator); the
-  *enforced* boundary is production work. This is roadmap item 1.
+- **OS isolation is verified only where the tests can run as root.** The
+  two-uid tests (`test_os_isolation`) skip without root and two non-root users;
+  an independent review run without root therefore did **not** verify SEC-001..004.
+  The in-process API boundary (no public ungated mutator) is tested everywhere.
 - **Key custody.** Keys are generated in-memory for the demo. Production keys
   live in an HSM / KMS / the platform keystore, per domain.
 - **Clock trust.** Expiry uses local wall-clock time. A hardened deployment needs
@@ -139,5 +185,4 @@ boundaries at the API surface and with separate keys and separate stores. It doe
 - **Side channels, supply chain, and host compromise.** Out of scope here.
 
 The point of the slice is to make the **authority and evidence boundaries**
-real, testable, and regression-guarded first. The OS-level hardening attaches to
-exactly these same seams without changing the contracts.
+real, testable, and regression-guarded first.

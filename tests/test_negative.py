@@ -237,6 +237,20 @@ class ReceiptIsNotObservationTest(unittest.TestCase):
         self.assertFalse(recon.trustworthy)
         self.assertEqual(recon.observation.witnessed_value, "info")
 
+    def test_receipt_for_a_different_effect_is_not_trustworthy(self) -> None:
+        # Reviewer's reproduction: a genuine receipt for effect A, reconciled
+        # against effect B whose expected value happens to match current state.
+        proposal_a = self.sys.proposer.propose_config_change("log.level", "debug")
+        result = self.sys.broker.run(proposal_a)
+        self.assertTrue(result.verified)
+
+        effect_b = dict(proposal_a.effect, precondition="info")  # different identity
+        recon = self.sys.witness.reconcile(result.receipt, effect_b)
+        self.assertTrue(recon.receipt_signature_valid)  # the receipt itself is genuine
+        self.assertTrue(recon.receipt_matches_reality)  # and the value does agree
+        self.assertFalse(recon.receipt_bound_to_effect)  # but it is about another effect
+        self.assertFalse(recon.trustworthy)
+
     def test_fabricated_receipt_fails_signature_check(self) -> None:
         # An attacker fabricates a "success" receipt signed with the wrong key.
         proposal = self.sys.proposer.propose_config_change("log.level", "debug")

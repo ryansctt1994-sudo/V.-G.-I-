@@ -35,10 +35,17 @@ class Reconciliation:
     observation: Observation
     receipt_signature_valid: bool
     receipt_matches_reality: bool
+    receipt_bound_to_effect: bool
 
     @property
     def trustworthy(self) -> bool:
-        return self.receipt_signature_valid and self.receipt_matches_reality
+        # All three are required. A valid receipt for a *different* effect proves
+        # nothing about this one, even if the observed value happens to agree.
+        return (
+            self.receipt_signature_valid
+            and self.receipt_bound_to_effect
+            and self.receipt_matches_reality
+        )
 
 
 class Witness:
@@ -77,6 +84,12 @@ class Witness:
             signed.executor_key_id == self._executor_key.key_id
             and self._executor_key.verify(canonical(r), signed.signature)
         )
+        # Bind the receipt to the effect being checked: same effect identity and
+        # an outcome that claims the effect was actually applied.
+        bound = (
+            r.get("effect_id") == effect_identity(effect)
+            and r.get("outcome") == "applied"
+        )
         witnessed = self._read(effect["key"])
         # The receipt claims the resource now holds `new_value`.
         claimed = r.get("new_value")
@@ -93,4 +106,5 @@ class Witness:
             observation=observation,
             receipt_signature_valid=sig_valid,
             receipt_matches_reality=matches_reality,
+            receipt_bound_to_effect=bound,
         )

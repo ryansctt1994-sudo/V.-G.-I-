@@ -31,7 +31,7 @@ from typing import Iterable
 from vgi.crypto import KeyPair, VerifyKey
 from vgi.execution.freshness import FreshnessAuthority
 from vgi.execution.ipc import PeerCredentials, peer_credentials, recv_msg, send_msg
-from vgi.execution.resource_owner import AuthorizationError, ResourceOwner
+from vgi.execution.resource_owner import AuthorizationError, RecoveryBlocked, ResourceOwner
 
 KEYFILE_NAME = "owner_keys.json"
 
@@ -58,6 +58,10 @@ def build_owner(secret_dir: str, *, resource_db: str, freshness_db: str) -> Reso
         authority_verify_key=VerifyKey.from_hex(km["authority_pub"]),
         freshness=freshness,
     )
+
+
+_REQUEST_FIELDS = {"effect", "grant_token", "request_id"}
+_CONN_TIMEOUT = 10.0
 
 
 def _classify(outcome: str) -> str:
@@ -88,43 +92,81 @@ class OwnerService:
                 {"outcome": "REFUSED", "reason": "peer uid not authorized", "peer_uid": peer.uid},
             )
             return
-        request = recv_msg(conn)
-        effect = request.get("effect")
-        grant_token = request.get("grant_token")
+
+        try:
+            request = recv_msg(conn)
+        except ValueError:  # bad framing, oversize, invalid JSON / UTF-8
+            send_msg(conn, {"outcome": "REFUSED", "reason": "malformed message"})
+            return
+
+        # Strict envelope: an object with only the known fields.
+        if not isinstance(request, dict) or not set(request) <= _REQUEST_FIELDS:
+            send_msg(conn, {"outcome": "REFUSED", "reason": "malformed request"})
+            return
         request_id = request.get("request_id")
+        if request_id is not None and not isinstance(request_id, str):
+            send_msg(conn, {"outcome": "REFUSED", "reason": "malformed request_id"})
+            return
+
         try:
             signed = self._owner.redeem_and_apply(
-                {"effect": effect, "grant_token": grant_token}
+                {"effect": request.get("effect"), "grant_token": request.get("grant_token")}
             )
+        except RecoveryBlocked as e:
+            # Prior execution cannot be determined: say so, never claim REFUSED.
+            send_msg(conn, {"outcome": "UNKNOWN", "reason": str(e), "request_id": request_id})
+            return
+        except AuthorizationError as e:
+            send_msg(conn, {"outcome": "REFUSED", "reason": str(e), "request_id": request_id})
+            return
+        except Exception:
+            # An internal failure may have happened after a commit, so the honest
+            # answer is UNKNOWN; the durable record decides on retry.
             send_msg(
                 conn,
                 {
-                    "outcome": _classify(signed.receipt["outcome"]),
-                    "receipt_outcome": signed.receipt["outcome"],
-                    "receipt": signed.to_dict(),
+                    "outcome": "UNKNOWN",
+                    "reason": "internal error; outcome undetermined",
                     "request_id": request_id,
                 },
             )
-        except AuthorizationError as e:
-            send_msg(
-                conn,
-                {"outcome": "REFUSED", "reason": str(e), "request_id": request_id},
-            )
+            return
 
-    def serve_forever(self) -> None:
+        send_msg(
+            conn,
+            {
+                "outcome": _classify(signed.receipt["outcome"]),
+                "receipt_outcome": signed.receipt["outcome"],
+                "receipt": signed.to_dict(),
+                "request_id": request_id,
+            },
+        )
+
+    def serve_forever(self, stop_event=None) -> None:
+        """Serve until `stop_event` (a threading.Event) is set, or forever.
+
+        A single connection can never terminate the loop: every per-connection
+        failure is contained, and each connection has a read timeout so a peer
+        that connects and stalls cannot hold the service indefinitely.
+        """
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         if os.path.exists(self._sock_path):
             os.unlink(self._sock_path)
         srv.bind(self._sock_path)
         os.chmod(self._sock_path, 0o777)  # peers may connect; auth is via SO_PEERCRED
         srv.listen(16)
+        srv.settimeout(0.2)
         try:
-            while True:
-                conn, _ = srv.accept()
+            while stop_event is None or not stop_event.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                conn.settimeout(_CONN_TIMEOUT)
                 try:
                     self._handle(conn)
-                except (ConnectionError, ValueError):
-                    pass
+                except Exception:
+                    pass  # contained: one bad connection never stops the service
                 finally:
                     conn.close()
         finally:

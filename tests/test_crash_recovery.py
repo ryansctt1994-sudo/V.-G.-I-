@@ -8,15 +8,23 @@ need its own recovery guarantee; that is what the UNKNOWN outcome is for, and
 scenario 4 below covers it.
 
 Boundaries (set via the owner's crash_hook):
-  before_transaction  -> nothing written
-  mid_transaction     -> effect written but not committed
-  after_commit        -> effect + receipt committed, freshness not yet advanced
+  before_transaction  -> nothing written anywhere            -> retry completes
+  after_reserve       -> grant PENDING, resource untouched    -> BLOCKED (UNKNOWN)
+  mid_transaction     -> PENDING, effect written, uncommitted -> no partial effect, BLOCKED
+  after_commit        -> committed, not yet marked COMMITTED  -> retry returns original
+
+A crash after the reservation but before the commit is indistinguishable, from
+durable state alone, from "committed and then the resource was rolled back". So
+those retries are BLOCKED with an UNKNOWN outcome instead of re-executing — the
+reviewer-reported rollback-replay is exactly the case this prevents
+(`test_crash_after_commit_then_snapshot_restore_does_not_replay`).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import tempfile
@@ -26,7 +34,7 @@ import unittest
 from vgi.crypto import KeyPair
 from vgi.execution.freshness import FreshnessAuthority
 from vgi.execution.outcomes import ConfirmationUnavailable, OutcomeResolver
-from vgi.execution.resource_owner import AuthorizationError, ResourceOwner
+from vgi.execution.resource_owner import AuthorizationError, RecoveryBlocked, ResourceOwner
 from vgi.governance.grants import GrantAuthority
 from vgi.governance.policy import default_config_policy
 from vgi.intelligence.proposer import Proposer
@@ -116,18 +124,63 @@ class CrashRecoveryTest(unittest.TestCase):
 
     # -- scenario 2 ---------------------------------------------------------
 
-    def test_crash_mid_transaction_leaves_no_partial_effect(self) -> None:
+    def test_crash_mid_transaction_leaves_no_partial_effect_and_blocks(self) -> None:
         status = self._redeem_then_crash_at("mid_transaction")
         self._assert_killed(status)
         # No committed receipt and no partial effect.
         self.assertIsNone(self._stored_receipt_id())
         self.assertIsNone(self._current_value())
-        # Retry completes cleanly.
+        # The grant was reserved, so a retry cannot tell this crash apart from a
+        # commit-then-rollback. It is blocked, never silently re-executed.
         owner = self._owner()
-        receipt = owner.redeem_and_apply(self.request)
-        self.assertEqual(receipt.receipt["outcome"], "applied")
-        self.assertEqual(owner.current_value("log.level"), "debug")
+        with self.assertRaises(RecoveryBlocked):
+            owner.redeem_and_apply(self.request)
+        self.assertIsNone(owner.current_value("log.level"))
         owner.close()
+
+    def test_crash_after_reserve_blocks(self) -> None:
+        status = self._redeem_then_crash_at("after_reserve")
+        self._assert_killed(status)
+        self.assertIsNone(self._stored_receipt_id())
+        owner = self._owner()
+        with self.assertRaises(RecoveryBlocked):
+            owner.redeem_and_apply(self.request)
+        self.assertIsNone(owner.current_value("log.level"))
+        owner.close()
+
+    # -- reviewer-reported defect: crash + snapshot restore -----------------
+
+    def test_crash_after_commit_then_snapshot_restore_does_not_replay(self) -> None:
+        # Pre-commit snapshot of the resource store (schema only, no redemption).
+        self._owner().close()
+        snap = os.path.join(self.workdir, "snap")
+        os.makedirs(snap)
+        for f in self._db_files():
+            if os.path.exists(f):
+                shutil.copy2(f, snap)
+
+        # Commit, then die before the coordination store learns of the commit.
+        self._assert_killed(self._redeem_then_crash_at("after_commit"))
+        self.assertIsNotNone(self._stored_receipt_id())  # it really committed
+
+        # Restore ONLY the resource store to the pre-commit snapshot. The
+        # coordination store is outside the rollback boundary and is untouched.
+        for f in self._db_files():
+            if os.path.exists(f):
+                os.remove(f)
+        for name in os.listdir(snap):
+            shutil.copy2(os.path.join(snap, name), self.workdir)
+
+        # Restart and retry: the grant must NOT apply again.
+        owner = self._owner()
+        with self.assertRaises(RecoveryBlocked):
+            owner.redeem_and_apply(self.request)
+        self.assertIsNone(owner.current_value("log.level"))
+        owner.close()
+        self.assertIsNone(self._stored_receipt_id())  # no second receipt
+
+    def _db_files(self) -> list:
+        return [self.resource_db, self.resource_db + "-wal", self.resource_db + "-shm"]
 
     # -- scenario 3 ---------------------------------------------------------
 
