@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vgi"
+version = "0.1.0"
+description = "A verified, governed intelligence platform — one protected transaction, proven."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=42.0",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[tool.setuptools]
+packages = ["vgi", "vgi.contracts", "vgi.intelligence", "vgi.governance", "vgi.execution", "vgi.evidence", "vgi.verification"]
+
+[tool.setuptools.package-dir]
+"" = "."
