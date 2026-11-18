@@ -92,7 +92,8 @@ class ResourceOwner:
             "CREATE TABLE IF NOT EXISTS redemptions ("
             "  grant_id TEXT PRIMARY KEY,"
             "  effect_id TEXT NOT NULL,"
-            "  receipt_json TEXT NOT NULL"
+            "  receipt_json TEXT NOT NULL,"
+            "  supersedes TEXT"
             ")"
         )
         self._conn.commit()
@@ -109,14 +110,23 @@ class ResourceOwner:
     def recover(self) -> int:
         """Startup reconciliation. Every grant with a local redemption record did
         commit here, so mark it COMMITTED in the coordination store (repairing a
-        crash between commit and mark). Grants that are PENDING with no local
-        record are deliberately left PENDING: they stay blocked."""
-        rows = self._conn.execute("SELECT grant_id FROM redemptions").fetchall()
+        crash between commit and mark), and re-assert any replacement resolution
+        (repairing a crash between commit and record_resolution). Grants that are
+        PENDING with no local record are deliberately left PENDING: they stay
+        blocked."""
+        import json
+
+        rows = self._conn.execute(
+            "SELECT grant_id, supersedes, receipt_json FROM redemptions"
+        ).fetchall()
         reconciled = 0
-        for (grant_id,) in rows:
+        for grant_id, supersedes, receipt_json in rows:
             if self._freshness.state(grant_id) != COMMITTED:
                 self._freshness.mark_committed(grant_id)
                 reconciled += 1
+            if supersedes:
+                outcome = json.loads(receipt_json)["receipt"]["outcome"]
+                self._freshness.record_resolution(supersedes, grant_id, outcome)
         return reconciled
 
     def unresolved_grants(self) -> dict:
@@ -145,6 +155,36 @@ class ResourceOwner:
                 g for g in self._freshness.grants_in_state(COMMITTED) if g not in local
             ],
         }
+
+    def resolutions_for(self, grant_id: str) -> list:
+        """Replacement attempts recorded against an unresolved grant, in order.
+        Each: {"replacement": id, "outcome": applied|rejected, "resolved_at": t}."""
+        return self._freshness.resolutions_for(grant_id)
+
+    def recovery_worklist(self) -> list:
+        """The operator view that records what happened to BOTH grants: every
+        unresolved grant, its category, and the replacement attempts against it.
+
+        A grant with an `applied` replacement is marked resolved, yet it stays in
+        its unresolved category and its own execution stays UNKNOWN — both facts
+        are preserved, because a replacement establishes the desired state, it
+        does not prove the original attempt did or did not happen.
+        """
+        unresolved = self.unresolved_grants()
+        worklist = []
+        for category in ("blocked", "rolled_back"):
+            for gid in unresolved[category]:
+                resolutions = self.resolutions_for(gid)
+                worklist.append(
+                    {
+                        "grant_id": gid,
+                        "category": category,
+                        "original_execution": "UNKNOWN" if category == "blocked" else "LOST",
+                        "resolutions": resolutions,
+                        "resolved": any(r["outcome"] == "applied" for r in resolutions),
+                    }
+                )
+        return worklist
 
     # -- the sole public mutation entry point -------------------------------
 
@@ -183,10 +223,18 @@ class ResourceOwner:
 
             grant_id = grant["grant_id"]
             seq = int(grant["freshness_seq"])
+            supersedes = grant.get("supersedes")
         except AuthorizationError:
             raise
         except (KeyError, TypeError, ValueError, AttributeError) as e:
             raise AuthorizationError(f"malformed grant token: {type(e).__name__}")
+
+        # A replacement must be compare-and-set, so it cannot overwrite a newer
+        # update than the one its operator reviewed.
+        if supersedes is not None and effect.get("precondition") is None:
+            raise AuthorizationError(
+                "replacement grant must carry a current-state precondition"
+            )
 
         # Fast path for honest retries (re-checked under the lock below).
         existing = self._conn.execute(
@@ -197,15 +245,23 @@ class ResourceOwner:
 
         self._crash("before_transaction")
 
-        signed = self._redeem_locked(effect, grant_id, seq)
+        signed = self._redeem_locked(effect, grant_id, seq, supersedes)
 
         self._crash("after_commit")
         self._freshness.mark_committed(grant_id, seq)
+        # Record the resolution AFTER the commit; recover() re-asserts it if we
+        # crash here. It never changes the superseded grant's own state.
+        if supersedes is not None:
+            self._freshness.record_resolution(
+                supersedes, grant_id, signed.receipt["outcome"]
+            )
         return signed
 
     # -- internals ----------------------------------------------------------
 
-    def _redeem_locked(self, effect: dict, grant_id: str, seq: int) -> SignedReceipt:
+    def _redeem_locked(
+        self, effect: dict, grant_id: str, seq: int, supersedes: str | None = None
+    ) -> SignedReceipt:
         key = effect["key"]
         new_value = effect["value"]
         precondition = effect.get("precondition")
@@ -221,6 +277,20 @@ class ResourceOwner:
             if dup is not None:
                 self._conn.commit()
                 return SignedReceipt(**json.loads(dup[0]))
+
+            # (1b) A replacement may only supersede a grant that is actually
+            # unresolved here: known to the coordination store, with no local
+            # record (i.e. blocked or rolled_back). Checked under the lock.
+            if supersedes is not None:
+                orig_state = self._freshness.state(supersedes)
+                orig_local = cur.execute(
+                    "SELECT 1 FROM redemptions WHERE grant_id = ?", (supersedes,)
+                ).fetchone()
+                if orig_state is None or orig_local is not None:
+                    self._conn.rollback()
+                    raise AuthorizationError(
+                        "replacement supersedes a grant that is not unresolved"
+                    )
 
             # (2) Authorization cutoff: atomic revocation check + reservation in the
             # coordination store, outside the resource's rollback boundary.
@@ -270,9 +340,9 @@ class ResourceOwner:
             )
             signed = self._sign_receipt(receipt)
             cur.execute(
-                "INSERT INTO redemptions (grant_id, effect_id, receipt_json) "
-                "VALUES (?, ?, ?)",
-                (grant_id, eid, json.dumps(signed.to_dict())),
+                "INSERT INTO redemptions (grant_id, effect_id, receipt_json, supersedes) "
+                "VALUES (?, ?, ?, ?)",
+                (grant_id, eid, json.dumps(signed.to_dict()), supersedes),
             )
             self._conn.commit()
             return signed

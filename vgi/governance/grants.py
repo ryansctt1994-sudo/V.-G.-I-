@@ -78,7 +78,11 @@ class GrantAuthority:
         """Public key handed to the execution and evidence domains."""
         return self._key.verify_key
 
-    def issue(self, proposal: Proposal) -> GrantToken:
+    def issue(self, proposal: Proposal, *, supersedes: str | None = None) -> GrantToken:
+        """Issue a grant. `supersedes` makes it a governed replacement for an
+        earlier unresolved grant: it gets its own fresh policy decision, and it
+        MUST carry a current-state precondition so it cannot overwrite a newer
+        update (the owner enforces this too)."""
         decision: PolicyDecision = self._policy.evaluate(proposal)
         if not decision.allowed:
             raise GrantError(f"policy denied: {decision.reason}")
@@ -87,6 +91,11 @@ class GrantAuthority:
         # Defensive: the decision must be about this exact effect.
         if decision.effect_id != eid:
             raise GrantError("policy decision does not match proposal effect")
+
+        if supersedes is not None and proposal.effect.get("precondition") is None:
+            raise GrantError(
+                "a replacement grant must carry a current-state precondition"
+            )
 
         now = time.time()
         grant = Grant(
@@ -97,6 +106,7 @@ class GrantAuthority:
             policy_decision_id=decision.decision_id,
             issued_at=now,
             expires_at=now + self._ttl,
+            supersedes=supersedes,
         )
         signature = self._key.sign(canonical(grant.to_dict()))
         return GrantToken(

@@ -62,6 +62,18 @@ class FreshnessAuthority:
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS revoked (grant_id TEXT PRIMARY KEY, revoked_at REAL)"
         )
+        # Audit trail of governed replacements. A row says "replacement R was
+        # applied/rejected as a replacement for the unresolved grant O". It never
+        # changes O's own state: O stays blocked, its own execution stays UNKNOWN.
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS resolutions ("
+            "  original_grant_id TEXT NOT NULL,"
+            "  replacement_grant_id TEXT NOT NULL,"
+            "  replacement_outcome TEXT NOT NULL,"
+            "  resolved_at REAL NOT NULL,"
+            "  PRIMARY KEY (original_grant_id, replacement_grant_id)"
+            ")"
+        )
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL)"
         )
@@ -174,6 +186,31 @@ class FreshnessAuthority:
             ).fetchone()
             is not None
         )
+
+    # -- replacement resolutions (audit trail) ------------------------------
+
+    def record_resolution(
+        self, original_grant_id: str, replacement_grant_id: str, outcome: str
+    ) -> None:
+        """Record that a replacement was redeemed for an unresolved grant.
+        Idempotent per (original, replacement) so recovery can re-assert it."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO resolutions "
+            "(original_grant_id, replacement_grant_id, replacement_outcome, resolved_at) "
+            "VALUES (?, ?, ?, ?)",
+            (original_grant_id, replacement_grant_id, outcome, time.time()),
+        )
+        self._conn.commit()
+
+    def resolutions_for(self, original_grant_id: str) -> list:
+        return [
+            {"replacement": r[0], "outcome": r[1], "resolved_at": r[2]}
+            for r in self._conn.execute(
+                "SELECT replacement_grant_id, replacement_outcome, resolved_at "
+                "FROM resolutions WHERE original_grant_id = ? ORDER BY resolved_at, replacement_grant_id",
+                (original_grant_id,),
+            )
+        ]
 
     @property
     def high_water(self) -> int:

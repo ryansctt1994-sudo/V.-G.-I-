@@ -47,6 +47,26 @@ The reviewer also raised two accuracy points, now fixed and tested in
   loss of a known committed redemption; its receipt distinguishes applied from
   rejected.
 
+## Reviewer Priority 1 — govern replacement grants (done)
+
+The reviewer's next-increment spec: link each replacement to the unresolved grant,
+require a fresh policy decision, bind to the reviewed resource version, and record
+what happened to both grants. Implemented and tested in
+`test_replacement_governance`:
+
+| Done-when | Test |
+|---|---|
+| A replacement cannot overwrite a newer update | `...update_between_review_and_redemption_rejects_replacement` |
+| Enforced compare-and-set (authority **and** owner) | `...authority_refuses_replacement_without_precondition`, `...owner_refuses_replacement_without_precondition` |
+| Link only to a genuinely unresolved grant | `...cannot_supersede_a_cleanly_committed_grant`, `...cannot_supersede_an_unknown_grant` |
+| Original stays blocked / `UNKNOWN` after a successful replacement | `...successful_replacement_resolves_worklist_original_stays_unknown` |
+| Concurrent replacements apply at most once | `...concurrent_replacements_apply_at_most_once` |
+| Resolution survives a crash before it is recorded | `...resolution_is_reasserted_after_crash_before_record` |
+
+Not addressed by this increment (still open, see below): JSON hardening (Priority
+2), ledger↔broker integration (Priority 4), and the "expect-absent" precondition
+gap.
+
 ## Adversarial regression tests (SEC-###)
 
 | ID | Claim | Status | Test |
@@ -154,8 +174,19 @@ Prior chat summaries overstated a few things; corrected here and in the threat m
   separate trust boundary from the ledger, not provided by it.
 - Governance registry + amendment control (GOV-01..03, SEC-019).
 - Capability attenuator (PRIV-01, SEC-020).
-- Broader input hardening: raw-JSON duplicate keys, NaN/Infinity (SEC-021 full).
+- Broader input hardening at the trust boundary: raw-JSON duplicate keys,
+  NaN/Infinity, rejected before policy/verify/execute (reviewer Priority 2).
+- Ledger↔broker integration: how receipts reach the ledger after commit and how a
+  retry handles interrupted publication (reviewer Priority 4).
+- "Expect-absent" preconditions, and an operation to formally close a resolved
+  blocked entry (replacement linkage itself is now built — see above).
+- Observation independence under common control (SEC-016 full, OBS-02 wiring) — a
+  separate trust boundary from the ledger, not provided by it.
+- Governance registry + amendment control (GOV-01..03, SEC-019).
+- Capability attenuator (PRIV-01, SEC-020).
 - Unauthorized outcome-query protection (SEC-023) — no query API yet.
 - Formal-proof adapter execution (T13) — the preflight exists; a real Lean/SMT
   check does not yet run.
-- An actual independent-operator reproduction run (DoD #10).
+- Non-idempotent / external effects (the one effect type is `set`).
+- An actual independent-operator reproduction run (DoD #10); two-uid OS isolation
+  and the D4 bound-socket loop still need a capable environment.

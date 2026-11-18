@@ -159,6 +159,11 @@ class Grant:
     issued_at: float
     expires_at: float
     contract_version: str = CONTRACT_VERSION
+    # When set, this grant is a governed replacement for an earlier, unresolved
+    # grant (one that is blocked or whose committed redemption was rolled back).
+    # A replacement must carry a current-state precondition; the owner enforces
+    # that. `supersedes` is part of the signed body. None for an ordinary grant.
+    supersedes: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)

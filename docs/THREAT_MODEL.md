@@ -84,6 +84,10 @@ These are explicit so no result is read as more than it is:
 11. **A malformed request from an allowed peer cannot stop the service.** Every
     per-connection failure is contained; stalled peers time out.
     → `test_ipc_robustness`
+12. **Replacement of an unresolved grant is governed.** Fresh policy decision,
+    enforced compare-and-set, link only to a genuinely unresolved grant, durable
+    resolution record; the original stays blocked / `UNKNOWN`.
+    → `test_replacement_governance`
 
 ### Audited input inventory (basis for the path-substitution claim)
 
@@ -195,26 +199,44 @@ and nothing in the system treats it as such:
 So before issuing a replacement, an operator should compare the receipt store, the
 ledger and any downstream observers, and record the decision somewhere durable.
 
-**A replacement authorizes the presently-intended effect, not a re-run of the
-old one.** Re-issuing the original grant's effect verbatim is unsafe even for
-`set`: `set` is idempotent only *absent an intervening write*. If another
-authorized grant changed the key after the blocked attempt, blindly replaying the
-old assignment overwrites that newer value. The replacement should name the effect
-that is intended *now*, and should carry a **current-state precondition**
-(compare-and-set) so that if the state is not what the operator believed, the
-replacement is `rejected` rather than silently clobbering it. Both the hazard and
-the precondition guard are shown in `test_recovery_replacement`.
+**Governed replacement (now a system guarantee, not just a convention).** A
+replacement is a grant that carries a signed `supersedes` link to the unresolved
+grant. The authorization path enforces three things, so a replacement cannot
+quietly become a verbatim re-run:
+
+- It gets its own **fresh policy decision** (every `issue` evaluates policy).
+- It **must carry a current-state precondition** (compare-and-set); both the
+  authority and the resource owner refuse one that does not. So if the state moved
+  after the operator reviewed it, the replacement is `rejected`, not applied —
+  it cannot overwrite a newer update.
+- It may only supersede a grant that is **actually unresolved** here (known to the
+  coordination store, no local record); superseding a cleanly-committed or unknown
+  grant is refused.
+
+On redemption the owner records a durable **resolution** (`original`,
+`replacement`, the replacement's `applied`/`rejected` outcome) in the coordination
+store, re-asserted by `recover()` if a crash interrupts it. `recovery_worklist()`
+shows, per unresolved grant, its category and every replacement attempt against it.
+
+Crucially, **the original stays blocked and its own execution stays `UNKNOWN`**
+even after a successful replacement. A replacement establishes the desired state;
+it is not evidence about whether the original attempt happened. Both facts are
+preserved in the worklist. Shown in `test_replacement_governance` (success,
+intervening-update rejection, concurrent attempts, crash-before-resolution).
 
 **Not built, stated so it is not assumed:**
 
-- Nothing links a replacement grant to the blocked one (no `supersedes`), and there
-  is no operation to formally close a `blocked` entry; entries stay listed.
-- The coordination store does not record a redemption's `applied`/`rejected`
-  outcome, so `unresolved_grants` cannot distinguish them; that needs the receipt.
-- Even with a precondition, the one effect type is `set`. A non-idempotent effect
-  (an increment, an external side effect) can still double-apply its real-world
-  consequence across a replacement, and a compare-and-set on a single key does not
-  fix that. Such effects need their own design before they exist.
+- There is no operation to formally *close* a blocked entry; a resolved original
+  stays listed as blocked/`UNKNOWN`. That is deliberate (preserve both facts), not
+  an oversight — but it means the worklist grows until an external process prunes
+  resolved entries.
+- A current-state precondition can express "expect this value", not "expect the key
+  absent" (`precondition=None` means unconditional). A replacement for a key the
+  operator reviewed as absent cannot yet be bound as compare-and-set.
+- The one effect type is `set`. A non-idempotent effect (an increment, an external
+  side effect) can still double-apply its real-world consequence across a
+  replacement, and a compare-and-set on a single key does not fix that. Such
+  effects need their own design before they exist.
 
 ### The precondition, proven both ways
 
